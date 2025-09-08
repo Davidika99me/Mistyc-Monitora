@@ -1,0 +1,312 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <EEPROM.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+const int interruptor = 10;
+const int vermelho = 9;
+const int verde = 8;
+const int botaoReset = 11;
+
+const int releIN1 = 6;
+const int releIN2 = 7;
+
+#define ADDR_TURNO 0
+#define ADDR_PROD1 10
+#define ADDR_PROD2 20
+#define ADDR_PROD3 30
+#define ADDR_TOTAL 40
+#define ADDR_RELOGIO 50
+#define ADDR_T_LIGADO 60
+#define ADDR_T_DESLIGADO 70
+#define ADDR_EEPROM_INIT_FLAG 80
+
+unsigned long tempoAnterior = 0;
+int contadorSegundos = 0;
+unsigned long tempoLigadoTotal = 0;
+unsigned long tempoDesligadoTotal = 0;
+unsigned long producaoTotal = 0;
+unsigned long segundosRelogio = 0;
+float eficiencia = 100.0;
+unsigned int turnoAtual = 1;
+unsigned int producaoTurno1 = 0;
+unsigned int producaoTurno2 = 0;
+unsigned int producaoTurno3 = 0;
+bool ligado = false;
+
+bool resetando = false;
+unsigned long ultimoReset = 0;
+const unsigned long DEBOUNCE_DELAY = 500;
+
+bool simulandoApagao = false;
+unsigned long tempoInicioApagao = 0;
+unsigned long duracaoApagaoSegundos = 0;
+
+unsigned long tempoUltimoToggleReleIN1 = 0;
+const unsigned long INTERVALO_TOGGLE_RELE = 11000;
+bool releIN1Ativo = false;
+
+void setup() {
+  pinMode(interruptor, INPUT);
+  pinMode(vermelho, OUTPUT);
+  pinMode(verde, OUTPUT);
+  pinMode(botaoReset, INPUT);
+  pinMode(releIN1, OUTPUT);
+  pinMode(releIN2, OUTPUT);
+  digitalWrite(releIN1, HIGH);
+  digitalWrite(releIN2, HIGH);
+  Serial.begin(9600);
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.print("Iniciando...");
+  Serial.println("Iniciando...");
+
+  byte eepromInitFlag;
+  EEPROM.get(ADDR_EEPROM_INIT_FLAG, eepromInitFlag);
+
+  if (eepromInitFlag != 0xFF) {
+    Serial.println("Lendo dados da EEPROM...");
+    EEPROM.get(ADDR_TURNO, turnoAtual);
+    EEPROM.get(ADDR_PROD1, producaoTurno1);
+    EEPROM.get(ADDR_PROD2, producaoTurno2);
+    EEPROM.get(ADDR_PROD3, producaoTurno3);
+    EEPROM.get(ADDR_TOTAL, producaoTotal);
+    EEPROM.get(ADDR_RELOGIO, segundosRelogio);
+    EEPROM.get(ADDR_T_LIGADO, tempoLigadoTotal);
+    EEPROM.get(ADDR_T_DESLIGADO, tempoDesligadoTotal);
+
+    unsigned long tempoTotal = tempoLigadoTotal + tempoDesligadoTotal;
+    if (tempoTotal == 0) {
+        eficiencia = 100.0;
+    } else {
+        eficiencia = ((float)tempoLigadoTotal / tempoTotal) * 100.0;
+    }
+
+    if (turnoAtual == 0 || turnoAtual == 65535) {
+        turnoAtual = 1;
+        EEPROM.put(ADDR_TURNO, turnoAtual);
+        Serial.println("Turno corrigido para 1 (lido 0 ou 65535 da EEPROM).");
+    }
+
+  } else {
+    Serial.println("EEPROM nao inicializada ou resetada. Inicializando dados.");
+    resetEEPROM();
+  }
+
+  tempoAnterior = millis();
+  Serial.println("Para simular um apagao, digite 'APAGAO <segundos>' no Monitor Serial.");
+  Serial.println("Ex: APAGAO 60 (para 60 segundos de apagao)");
+  lcd.clear();
+}
+
+void loop() {
+  if (digitalRead(botaoReset) == HIGH && !resetando && (millis() - ultimoReset > DEBOUNCE_DELAY)) {
+    Serial.println("Botao de reset pressionado!");
+    resetEEPROM();
+    resetando = true;
+    ultimoReset = millis();
+    simulandoApagao = false;
+    Serial.println("Simulacao de apagao desativada devido ao reset.");
+  } else if (digitalRead(botaoReset) == LOW) {
+    resetando = false;
+  }
+
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    command.toUpperCase();
+
+    if (command.startsWith("APAGAO ")) {
+      int spaceIndex = command.indexOf(' ');
+      if (spaceIndex != -1) {
+        String durationString = command.substring(spaceIndex + 1);
+        duracaoApagaoSegundos = durationString.toInt();
+        if (duracaoApagaoSegundos > 0) {
+          simulandoApagao = true;
+          tempoInicioApagao = millis();
+          Serial.print("Simulando apagao por ");
+          Serial.print(duracaoApagaoSegundos);
+          Serial.println(" segundos.");
+          ligado = false;
+        } else {
+          Serial.println("Duracao do apagao invalida. Use 'APAGAO <segundos>'.");
+        }
+      }
+    }
+  }
+
+  if (simulandoApagao) {
+    if (millis() - tempoInicioApagao >= (duracaoApagaoSegundos * 1000UL)) {
+      simulandoApagao = false;
+      Serial.println("Simulacao de apagao encerrada.");
+    }
+    ligado = false;
+  } else {
+    ligado = (digitalRead(interruptor) == HIGH);
+  }
+
+  digitalWrite(verde, ligado);
+  digitalWrite(vermelho, !ligado);
+
+  if (ligado) {
+    digitalWrite(releIN2, LOW);
+  } else {
+    digitalWrite(releIN2, HIGH);
+  }
+
+  if (ligado && !simulandoApagao) {
+    if (millis() - tempoUltimoToggleReleIN1 >= INTERVALO_TOGGLE_RELE) {
+      tempoUltimoToggleReleIN1 = millis();
+      releIN1Ativo = !releIN1Ativo;
+      digitalWrite(releIN1, releIN1Ativo ? LOW : HIGH);
+    }
+  } else {
+    digitalWrite(releIN1, HIGH);
+    releIN1Ativo = false;
+  }
+
+  if (millis() - tempoAnterior >= 1000) {
+    tempoAnterior = millis();
+    contadorSegundos++;
+    segundosRelogio++;
+
+    if (ligado) {
+      tempoLigadoTotal++;
+      if (contadorSegundos % 10 == 0) {
+        if (turnoAtual == 1) producaoTurno1 += 1;
+        else if (turnoAtual == 2) producaoTurno2 += 1;
+        else if (turnoAtual == 3) producaoTurno3 += 1;
+        producaoTotal += 1;
+      }
+    } else {
+      tempoDesligadoTotal++;
+    }
+
+    unsigned long tempoTotal = tempoLigadoTotal + tempoDesligadoTotal;
+    if (tempoTotal == 0) {
+        eficiencia = 100.0;
+    } else {
+        eficiencia = ((float)tempoLigadoTotal / tempoTotal) * 100.0;
+    }
+
+    if (segundosRelogio >= 28800) {
+      segundosRelogio = 0;
+      turnoAtual++;
+      if (turnoAtual > 3) {
+        turnoAtual = 1;
+      }
+      Serial.print("Mudanca de Turno para: ");
+      Serial.println(turnoAtual);
+    }
+
+    if (contadorSegundos % 30 == 0) {
+      Serial.println("Salvando dados na EEPROM...");
+      EEPROM.put(ADDR_TURNO, turnoAtual);
+      EEPROM.put(ADDR_PROD1, producaoTurno1);
+      EEPROM.put(ADDR_PROD2, producaoTurno2);
+      EEPROM.put(ADDR_PROD3, producaoTurno3);
+      EEPROM.put(ADDR_TOTAL, producaoTotal);
+      EEPROM.put(ADDR_RELOGIO, segundosRelogio);
+      EEPROM.put(ADDR_T_LIGADO, tempoLigadoTotal);
+      EEPROM.put(ADDR_T_DESLIGADO, tempoDesligadoTotal);
+    }
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    if (simulandoApagao) {
+      lcd.print("APAG");
+    } else {
+      lcd.print(ligado ? "LIG" : "DES");
+    }
+    lcd.setCursor(4,0);
+    printRelogioLCD(segundosRelogio);
+    lcd.setCursor(13, 0);
+    lcd.print("T");
+    lcd.print(turnoAtual);
+
+    lcd.setCursor(0, 1);
+    lcd.print("Ef:");
+    lcd.print(eficiencia, 1);
+    lcd.print("% P:");
+    lcd.print(producaoTotal);
+
+    if (contadorSegundos % 2 == 0) {
+      Serial.println("--- Status da Maquina ---");
+      Serial.print("Estado: "); Serial.println(ligado ? "LIGADO" : "DESLIGADO");
+      if (simulandoApagao) {
+        Serial.print("SIMULANDO APAGAO! Tempo restante: ");
+        Serial.print(duracaoApagaoSegundos - ((millis() - tempoInicioApagao) / 1000UL));
+        Serial.println("s");
+      }
+      Serial.print("Relogio: "); printRelogioSerial(segundosRelogio);
+      Serial.print("Turno Atual: "); Serial.println(turnoAtual);
+      Serial.print("Tempo Ligado Total: "); Serial.println(tempoLigadoTotal);
+      Serial.print("Tempo Desligado Total: "); Serial.println(tempoDesligadoTotal);
+      Serial.print("Eficiencia: "); Serial.print(eficiencia, 2); Serial.println("%");
+      Serial.print("Producao Total: "); Serial.println(producaoTotal);
+      Serial.print("Producao Turno 1: "); Serial.println(producaoTurno1);
+      Serial.print("Producao Turno 2: "); Serial.println(producaoTurno2);
+      Serial.print("Producao Turno 3: "); Serial.println(producaoTurno3);
+      Serial.print("Rele IN1 (Toggle): ");
+      Serial.println(releIN1Ativo ? "ATIVO" : "INATIVO");
+      Serial.print("Rele IN2 (24V Const): ");
+      Serial.println(digitalRead(releIN2) == LOW ? "ATIVO" : "INATIVO");
+      Serial.println("-------------------------");
+    }
+  }
+}
+
+void printRelogioLCD(unsigned long segundos) {
+  int horas = segundos / 3600;
+  int minutos = (segundos % 3600) / 60;
+  int seg = segundos % 60;
+
+  if (horas < 10) lcd.print("0");
+  lcd.print(horas);
+  lcd.print(":");
+  if (minutos < 10) lcd.print("0");
+  lcd.print(minutos);
+  lcd.print(":");
+  if (seg < 10) lcd.print("0");
+  lcd.print(seg);
+}
+
+void printRelogioSerial(unsigned long segundos) {
+  int horas = segundos / 3600;
+  int minutos = (segundos % 3600) / 60;
+  int seg = segundos % 60;
+
+  Serial.print(horas < 10 ? "0" : "");
+  Serial.print(horas);
+  Serial.print(":");
+  Serial.print(minutos < 10 ? "0" : "");
+  Serial.print(minutos);
+  Serial.print(":");
+  Serial.print(seg < 10 ? "0" : "");
+  Serial.println(seg);
+}
+
+void resetEEPROM() {
+  Serial.println("Resetando EEPROM...");
+  for (int i = 0; i < EEPROM.length(); i++) {
+    EEPROM.write(i, 0xFF);
+  }
+
+  turnoAtual = 1;
+  producaoTurno1 = 0;
+  producaoTurno2 = 0;
+  producaoTurno3 = 0;
+  producaoTotal = 0;
+  segundosRelogio = 0;
+  tempoLigadoTotal = 0;
+  tempoDesligadoTotal = 0;
+  eficiencia = 100.0;
+  digitalWrite(releIN1, HIGH);
+  digitalWrite(releIN2, HIGH);
+  releIN1Ativo = false;
+
+  EEPROM.put(ADDR_TURNO, turnoAtual);
+  EEPROM.put(ADDR_EEPROM_INIT_FLAG, (byte)0x00);
+  Serial.println("EEPROM resetada e variaveis inicializadas!");
+}
